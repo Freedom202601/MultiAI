@@ -101,23 +101,38 @@ async function dispatch(target: Target, prompt: string) {
 async function askBackend(b: Backend, userInput: string, opts: RunOptions): Promise<RunResult> {
   const stop = spinner(`${b} thinking…`);
   let streamed = false;
+  let midLine = false; // true when the cursor is partway through a line
+  const begin = () => {
+    if (!streamed) {
+      stop();
+      process.stdout.write(`\n${badge(b)}\n`);
+      streamed = true;
+    }
+  };
+  // Claude streams text + tool activity live; Codex has no deltas (stays undefined).
   const onToken =
     b === "claude"
       ? (t: string) => {
-          if (!streamed) {
-            stop();
-            process.stdout.write(`\n${badge(b)}\n`);
-            streamed = true;
-          }
+          begin();
           process.stdout.write(t);
+          midLine = !t.endsWith("\n");
         }
       : undefined;
-  const r = await run(b, userInput, { ...opts, onToken });
+  const onActivity =
+    b === "claude"
+      ? (label: string) => {
+          begin();
+          if (midLine) process.stdout.write("\n");
+          process.stdout.write(`${C.dim}⚙ ${label}${C.reset}\n`);
+          midLine = false;
+        }
+      : undefined;
+  const r = await run(b, userInput, { ...opts, onToken, onActivity });
   if (!streamed) {
     stop();
     printResult(r);
   } else {
-    process.stdout.write("\n");
+    if (midLine) process.stdout.write("\n");
     printMeta(r);
   }
   return r;

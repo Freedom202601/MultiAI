@@ -16,6 +16,32 @@ export interface RunOptions {
   cwd?: string;
   resume?: string; // continue a prior session/thread of this backend
   onToken?: (t: string) => void; // called with text deltas as they stream in
+  onActivity?: (label: string) => void; // called when a tool is invoked, e.g. "Read(x.ts)"
+}
+
+// Turn a tool_use name + its (streamed) input JSON into a compact one-line label.
+function toolLabel(name: string, inputJson: string): string {
+  let input: Record<string, unknown> = {};
+  try {
+    input = JSON.parse(inputJson || "{}");
+  } catch {
+    /* input may be incomplete on error */
+  }
+  const keys = ["file_path", "path", "command", "query", "url", "pattern", "description", "subagent_type"];
+  let val: string | undefined;
+  for (const k of keys) {
+    if (typeof input[k] === "string") {
+      val = input[k] as string;
+      break;
+    }
+  }
+  if (!val) return name;
+  if (val.includes("/") && ["Read", "Edit", "Write", "Glob"].includes(name)) {
+    val = val.split("/").pop() || val;
+  }
+  val = val.replace(/\s+/g, " ").trim();
+  if (val.length > 60) val = `${val.slice(0, 57)}…`;
+  return `${name}(${val})`;
 }
 
 export interface RunResult {
@@ -76,6 +102,8 @@ export async function runClaude(prompt: string, opts: RunOptions = {}): Promise<
   let costUsd: number | undefined;
   let isError = false;
   let errMsg = "";
+  // Track in-flight tool_use blocks by index so we can label the tool + its args.
+  const tools = new Map<number, { name: string; json: string }>();
 
   const { code, stderr } = await execLines("claude", args, { cwd: opts.cwd }, (line) => {
     let j: any;
@@ -84,14 +112,20 @@ export async function runClaude(prompt: string, opts: RunOptions = {}): Promise<
     } catch {
       return;
     }
-    if (
-      j.type === "stream_event" &&
-      j.event?.type === "content_block_delta" &&
-      j.event.delta?.type === "text_delta"
-    ) {
-      const t: string = j.event.delta.text ?? "";
+    const e = j.type === "stream_event" ? j.event : undefined;
+    if (e?.type === "content_block_delta" && e.delta?.type === "text_delta") {
+      const t: string = e.delta.text ?? "";
       text += t;
       opts.onToken?.(t);
+    } else if (e?.type === "content_block_start" && e.content_block?.type === "tool_use") {
+      tools.set(e.index, { name: e.content_block.name ?? "tool", json: "" });
+    } else if (e?.type === "content_block_delta" && e.delta?.type === "input_json_delta") {
+      const b = tools.get(e.index);
+      if (b) b.json += e.delta.partial_json ?? "";
+    } else if (e?.type === "content_block_stop" && tools.has(e.index)) {
+      const b = tools.get(e.index)!;
+      tools.delete(e.index);
+      opts.onActivity?.(toolLabel(b.name, b.json));
     } else if (j.type === "result") {
       sessionId = j.session_id;
       if (typeof j.total_cost_usd === "number") costUsd = j.total_cost_usd;
