@@ -1,17 +1,21 @@
 // Backend adapters. Each wraps an *official* CLI in headless mode, so that all
 // authentication (subscription OAuth or API key) is delegated to that tool.
 // We never touch tokens ourselves — the user logs in once via `claude` / `codex`.
+//
+// Two capabilities beyond a plain call:
+//   • token streaming  — Claude streams via stream-json; Codex returns whole.
+//   • native sessions  — each result carries a `sessionId` the caller stores and
+//                        passes back as `opts.resume` to continue the thread.
 
 import { spawn } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 export type Backend = "claude" | "codex";
 
 export interface RunOptions {
   model?: string;
   cwd?: string;
+  resume?: string; // continue a prior session/thread of this backend
+  onToken?: (t: string) => void; // called with text deltas as they stream in
 }
 
 export interface RunResult {
@@ -21,115 +25,128 @@ export interface RunResult {
   error?: string;
   ms: number;
   costUsd?: number;
+  sessionId?: string; // pass back as opts.resume next turn to keep context
 }
 
-interface ExecResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-function exec(
+// Spawn a process, delivering each complete stdout line to `onLine` as it
+// arrives (for streaming). Resolves with exit code and collected stderr.
+function execLines(
   cmd: string,
   args: string[],
-  opts: { cwd?: string } = {},
-): Promise<ExecResult> {
+  opts: { cwd?: string },
+  onLine: (line: string) => void,
+): Promise<{ code: number; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       cwd: opts.cwd ?? process.cwd(),
-      // stdin is closed immediately (empty) so codex/claude never block waiting
-      // for piped input when there is no TTY.
+      // stdin closed so the CLIs never block waiting for piped input.
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
+    let buf = "";
     let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stdout.on("data", (d) => {
+      buf += d.toString();
+      let i: number;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i);
+        buf = buf.slice(i + 1);
+        if (line.trim()) onLine(line);
+      }
+    });
     child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", (e) =>
-      resolve({ code: -1, stdout, stderr: `${stderr}${String(e)}` }),
-    );
-    child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr }));
+    child.on("error", (e) => resolve({ code: -1, stderr: `${stderr}${String(e)}` }));
+    child.on("close", (code) => {
+      if (buf.trim()) onLine(buf);
+      resolve({ code: code ?? -1, stderr });
+    });
   });
 }
 
 // --- Claude Code -----------------------------------------------------------
-// `claude -p <prompt> --output-format json` emits a single JSON object whose
-// `.result` field holds the assistant's final text.
-export async function runClaude(
-  prompt: string,
-  opts: RunOptions = {},
-): Promise<RunResult> {
+export async function runClaude(prompt: string, opts: RunOptions = {}): Promise<RunResult> {
   const start = Date.now();
-  const args = ["-p", prompt, "--output-format", "json"];
+  const streaming = typeof opts.onToken === "function";
+  const args = ["-p", prompt, "--output-format", streaming ? "stream-json" : "json"];
+  if (streaming) args.push("--verbose", "--include-partial-messages");
+  if (opts.resume) args.push("--resume", opts.resume);
   if (opts.model) args.push("--model", opts.model);
 
-  const { code, stdout, stderr } = await exec("claude", args, { cwd: opts.cwd });
+  let text = "";
+  let sessionId: string | undefined;
+  let costUsd: number | undefined;
+  let isError = false;
+  let errMsg = "";
+
+  const { code, stderr } = await execLines("claude", args, { cwd: opts.cwd }, (line) => {
+    let j: any;
+    try {
+      j = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (
+      j.type === "stream_event" &&
+      j.event?.type === "content_block_delta" &&
+      j.event.delta?.type === "text_delta"
+    ) {
+      const t: string = j.event.delta.text ?? "";
+      text += t;
+      opts.onToken?.(t);
+    } else if (j.type === "result") {
+      sessionId = j.session_id;
+      if (typeof j.total_cost_usd === "number") costUsd = j.total_cost_usd;
+      if (j.is_error) {
+        isError = true;
+        errMsg = String(j.result ?? "error");
+      } else if (typeof j.result === "string") {
+        text = j.result; // authoritative final text
+      }
+    }
+  });
   const ms = Date.now() - start;
 
-  if (code !== 0 && !stdout.trim()) {
+  if (isError) return { backend: "claude", text: "", ok: false, error: errMsg, ms, sessionId };
+  if (code !== 0 && !text.trim())
     return { backend: "claude", text: "", ok: false, error: stderr.trim() || `exit ${code}`, ms };
-  }
-  try {
-    const json = JSON.parse(stdout);
-    if (json.is_error) {
-      return { backend: "claude", text: "", ok: false, error: String(json.result ?? "error"), ms };
-    }
-    return {
-      backend: "claude",
-      text: String(json.result ?? "").trim(),
-      ok: true,
-      ms,
-      costUsd: typeof json.total_cost_usd === "number" ? json.total_cost_usd : undefined,
-    };
-  } catch {
-    // Fallback: treat raw stdout as the answer.
-    return { backend: "claude", text: stdout.trim(), ok: true, ms };
-  }
+  return { backend: "claude", text: text.trim(), ok: true, ms, costUsd, sessionId };
 }
 
 // --- Codex -----------------------------------------------------------------
-// `codex exec <prompt> -o <file>` writes the final assistant message to <file>.
-// We read it back and clean up. `--skip-git-repo-check` avoids the trusted-dir
-// prompt when running outside a git repo.
-export async function runCodex(
-  prompt: string,
-  opts: RunOptions = {},
-): Promise<RunResult> {
+// `codex exec --json` emits JSONL events: `thread.started` gives the thread id
+// (for resume), and `item.completed` (agent_message) carries the final text.
+// This version does not emit token deltas, so Codex answers arrive whole.
+export async function runCodex(prompt: string, opts: RunOptions = {}): Promise<RunResult> {
   const start = Date.now();
-  const outFile = join(tmpdir(), `multiai-codex-${process.pid}-${start}.txt`);
-  const args = [
-    "exec",
-    prompt,
-    "--skip-git-repo-check",
-    "--color",
-    "never",
-    "-o",
-    outFile,
-  ];
+  // --json emits clean JSONL events, so no --color handling is needed; the
+  // `resume` subcommand also rejects --color, so we omit it for both paths.
+  const base = ["--skip-git-repo-check", "--json"];
+  const args = opts.resume
+    ? ["exec", "resume", opts.resume, prompt, ...base]
+    : ["exec", prompt, ...base];
   if (opts.model) args.push("--model", opts.model);
 
-  const { code, stderr } = await exec("codex", args, { cwd: opts.cwd });
+  let text = "";
+  let threadId: string | undefined;
+
+  const { code, stderr } = await execLines("codex", args, { cwd: opts.cwd }, (line) => {
+    let j: any;
+    try {
+      j = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (j.type === "thread.started" && j.thread_id) threadId = j.thread_id;
+    else if (j.type === "item.completed" && j.item?.type === "agent_message")
+      text = j.item.text ?? text;
+  });
   const ms = Date.now() - start;
 
-  let text = "";
-  try {
-    text = (await readFile(outFile, "utf8")).trim();
-  } catch {
-    /* file may not exist on hard failure */
-  } finally {
-    await unlink(outFile).catch(() => {});
-  }
-
-  if (!text) {
-    return { backend: "codex", text: "", ok: false, error: stderr.trim() || `exit ${code}`, ms };
-  }
-  return { backend: "codex", text, ok: true, ms };
+  text = text.trim();
+  if (!text) return { backend: "codex", text: "", ok: false, error: stderr.trim() || `exit ${code}`, ms };
+  // On resume the thread id keeps its original value; caller retains it if undefined.
+  return { backend: "codex", text, ok: true, ms, sessionId: threadId ?? opts.resume };
 }
 
-export function run(
-  backend: Backend,
-  prompt: string,
-  opts: RunOptions = {},
-): Promise<RunResult> {
+export function run(backend: Backend, prompt: string, opts: RunOptions = {}): Promise<RunResult> {
   return backend === "claude" ? runClaude(prompt, opts) : runCodex(prompt, opts);
 }

@@ -9,8 +9,8 @@ MultiAI just orchestrates them.
 MultiAI never touches your tokens. It shells out to the official binaries in
 headless mode:
 
-- `claude -p <prompt> --output-format json` (Claude Code)
-- `codex exec <prompt> -o <file>` (Codex)
+- `claude -p <prompt> --output-format stream-json` (Claude Code)
+- `codex exec <prompt> --json` (Codex)
 
 So you authenticate the normal way, once, using either a subscription login or
 an API key:
@@ -24,17 +24,21 @@ Whatever each tool is authorized to use, MultiAI reuses. Nothing to configure.
 
 ## Requirements
 
-- Node.js >= 23.6 (runs TypeScript directly via type stripping — no build step)
 - `claude` and `codex` on your `PATH`, both logged in
+- Node.js >= 20 to run the installed CLI (>= 23.6 to run the `.ts` sources
+  directly without building)
 
-## Run
+## Install / run
 
 ```bash
-# interactive shell
+# run without installing (builds on first use)
+npx github:Freedom202601/MultiAI
+
+# from source: interactive shell, no build step (needs Node >= 23.6)
 node src/cli.ts
 
-# or install a global `multiai` command
-npm link
+# or install a global `multiai` command from source
+npm install && npm run build && npm link
 multiai
 ```
 
@@ -60,34 +64,38 @@ at once. Override the startup default with `MULTIAI_DEFAULT=claude|codex|both`.
 | `/judge <text>`          | one model drafts; the other reviews & improves it    |
 | `/model <name>`          | set model for the active backend (needs a single one)|
 | `/model clear`           | reset the active backend's model to default          |
-| `/memory on\|off`        | toggle sending prior turns as context (default: on)  |
-| `/reset`                 | clear the conversation history                       |
-| `/history`               | show how many turns are remembered                   |
-| `/status`                | show current target, models & memory                 |
+| `/memory on\|off`        | continue the session vs. one-off turns (default: on) |
+| `/reset`                 | start a fresh session (forget the conversation)      |
+| `/history`               | show each backend's session status                   |
+| `/status`                | show target, models, memory & sessions               |
 | `/help`                  | show help                                            |
 | `/exit`                  | quit (or Ctrl-D)                                     |
 
-## Conversation memory
+## Streaming & memory
 
-Memory is **on by default**. MultiAI keeps a transcript of the session and
-prepends it to each new message, so the models remember earlier turns. Each
-backend sees every user turn but only its *own* prior replies, so it stays
-self-consistent — even in `both` mode where Claude and Codex answer in parallel.
-Turn it off with `/memory off` for one-off questions, or `/reset` to start fresh.
+- **Streaming:** when the target is a single backend, Claude streams its answer
+  token-by-token. Codex returns its answer whole (its `--json` mode emits no
+  token deltas in the current version). `both` and `/judge` run to completion
+  before printing.
+- **Memory (on by default):** MultiAI uses each tool's *native* session — it
+  stores the `session_id` / `thread_id` returned by a call and passes it back
+  via `claude --resume` / `codex exec resume` on the next turn. Each backend
+  keeps its own thread, so `both` mode continues two parallel conversations
+  correctly, and long sessions don't re-send a growing transcript. `/memory off`
+  makes turns one-off; `/reset` forgets everything.
 
 ## Architecture
 
 ```
 src/
-  backends.ts   # spawn the official CLIs headless, normalize their output
+  backends.ts   # spawn the official CLIs headless; stream + capture session ids
   modes.ts      # both() and judge() orchestration
   cli.ts        # arg parsing + interactive REPL
 ```
 
-## Known limitations (MVP)
+## Publishing to npm
 
-- Memory is a client-side transcript replayed each turn, so long sessions grow
-  the prompt. (A future option: switch to `claude --resume` / `codex exec
-  resume` for native, server-side session continuity.)
-- Output is captured whole, not streamed token-by-token.
-- `/both` and `/judge` run to completion before printing.
+The package builds `dist/` from `src/` via `tsc` (the `prepare` script), so
+`npm publish` ships compiled JS while the repo keeps only TypeScript. To publish
+under your own account, set `name` in `package.json` (the unscoped `multiai` is
+taken; this repo uses `multiai-cli`) and run `npm publish`.

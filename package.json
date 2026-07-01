@@ -1,17 +1,45 @@
 {
-  "name": "multiai",
+  "name": "multiai-cli",
   "version": "0.1.0",
-  "description": "A unified CLI shell that drives Claude Code and Codex side by side, reusing their own auth.",
+  "description": "One CLI shell that drives Claude Code and Codex side by side, reusing their own auth. Streams Claude token-by-token and keeps native multi-turn sessions for both.",
   "type": "module",
   "bin": {
-    "multiai": "src/cli.ts"
+    "multiai": "dist/cli.js"
   },
+  "files": [
+    "dist/",
+    "src/",
+    "README.md"
+  ],
   "scripts": {
     "start": "node src/cli.ts",
-    "link": "npm link"
+    "build": "tsc",
+    "prepare": "tsc"
   },
   "engines": {
-    "node": ">=23.6"
+    "node": ">=20"
   },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [
+    "cli",
+    "claude",
+    "codex",
+    "claude-code",
+    "ai",
+    "llm",
+    "repl"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Freedom202601/MultiAI.git"
+  },
+  "homepage": "https://github.com/Freedom202601/MultiAI#readme",
+  "bugs": {
+    "url": "https://github.com/Freedom202601/MultiAI/issues"
+  },
+  "author": "",
   "license": "MIT"
 }

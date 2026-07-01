@@ -35,15 +35,24 @@ function spinner(label: string): () => void {
   };
 }
 
-function printResult(r: RunResult) {
-  const meta = `${C.dim}(${(r.ms / 1000).toFixed(1)}s${
+function metaStr(r: RunResult): string {
+  return `${C.dim}(${(r.ms / 1000).toFixed(1)}s${
     r.costUsd !== undefined ? `, $${r.costUsd.toFixed(4)}` : ""
   })${C.reset}`;
+}
+
+// Footer line only — used after tokens were already streamed to the screen.
+function printMeta(r: RunResult) {
+  if (!r.ok) console.log(`${badge(r.backend)} ${C.red}✗ ${r.error}${C.reset}`);
+  else console.log(metaStr(r));
+}
+
+function printResult(r: RunResult) {
   if (!r.ok) {
-    console.log(`\n${badge(r.backend)} ${C.red}✗ error${C.reset} ${meta}\n${C.red}${r.error}${C.reset}`);
+    console.log(`\n${badge(r.backend)} ${C.red}✗ error${C.reset} ${metaStr(r)}\n${C.red}${r.error}${C.reset}`);
     return;
   }
-  console.log(`\n${badge(r.backend)} ${meta}\n${r.text}`);
+  console.log(`\n${badge(r.backend)} ${metaStr(r)}\n${r.text}`);
 }
 
 // --- session state ---------------------------------------------------------
@@ -58,46 +67,25 @@ function resolveDefault(): Target {
 const targetLabel = (t: Target) =>
   t === "both" ? `${badge("claude")}${C.dim}+${C.reset}${badge("codex")}` : badge(t);
 
-// One conversation turn: what the user said, and each backend's reply.
-interface HistoryEntry {
-  user: string;
-  answers: Partial<Record<Backend, string>>;
-}
-
 interface State {
   active: Target;
   models: { claude?: string; codex?: string };
   memory: boolean;
-  history: HistoryEntry[];
+  // Native session/thread ids per backend — the CLIs hold the actual history.
+  sessions: { claude?: string; codex?: string };
 }
-const state: State = { active: resolveDefault(), models: {}, memory: true, history: [] };
+const state: State = { active: resolveDefault(), models: {}, memory: true, sessions: {} };
 
-const optsFor = (b: Backend): RunOptions => ({ model: state.models[b], cwd: process.cwd() });
+// Options for a backend call: model, and (if memory on) the session to resume.
+const optsFor = (b: Backend): RunOptions => ({
+  model: state.models[b],
+  cwd: process.cwd(),
+  resume: state.memory ? state.sessions[b] : undefined,
+});
 
-// Prepend the conversation so far (as seen by this backend) to the new message.
-// Each backend sees every user turn but only its OWN prior replies, so it stays
-// self-consistent even in `both` mode where two models answer in parallel.
-function buildPrompt(b: Backend, userInput: string): string {
-  if (!state.memory || state.history.length === 0) return userInput;
-  const lines = ["You are continuing an ongoing conversation. Earlier turns:", ""];
-  for (const h of state.history) {
-    lines.push(`[User]: ${h.user}`);
-    if (h.answers[b]) lines.push(`[You]: ${h.answers[b]}`);
-  }
-  lines.push(
-    "",
-    `[User]: ${userInput}`,
-    "",
-    "Reply to the latest [User] message, using the earlier turns as context.",
-  );
-  return lines.join("\n");
-}
-
-// Append a turn to history (always logged; sending is gated by state.memory).
-function record(userInput: string, results: RunResult[]) {
-  const answers: Partial<Record<Backend, string>> = {};
-  for (const r of results) if (r.ok) answers[r.backend] = r.text;
-  state.history.push({ user: userInput, answers });
+// After a successful call, keep its session id so the next turn can resume it.
+function remember(r: RunResult) {
+  if (state.memory && r.ok && r.sessionId) state.sessions[r.backend] = r.sessionId;
 }
 
 // Route a bare message to whatever the active target is.
@@ -108,41 +96,59 @@ async function dispatch(target: Target, prompt: string) {
 
 async function askOne(b: Backend, userInput: string) {
   const stop = spinner(`${b} thinking…`);
-  const r = await run(b, buildPrompt(b, userInput), optsFor(b));
-  stop();
-  printResult(r);
-  record(userInput, [r]);
+  let streamed = false;
+  // Claude streams token-by-token; Codex returns whole (its --json has no deltas).
+  const onToken =
+    b === "claude"
+      ? (t: string) => {
+          if (!streamed) {
+            stop();
+            process.stdout.write(`\n${badge(b)}\n`);
+            streamed = true;
+          }
+          process.stdout.write(t);
+        }
+      : undefined;
+  const r = await run(b, userInput, { ...optsFor(b), onToken });
+  if (!streamed) {
+    stop();
+    printResult(r);
+  } else {
+    process.stdout.write("\n");
+    printMeta(r);
+  }
+  remember(r);
 }
 
 async function askBoth(userInput: string) {
   const stop = spinner("claude + codex thinking…");
   const results = await Promise.all([
-    run("claude", buildPrompt("claude", userInput), optsFor("claude")),
-    run("codex", buildPrompt("codex", userInput), optsFor("codex")),
+    run("claude", userInput, optsFor("claude")),
+    run("codex", userInput, optsFor("codex")),
   ]);
   stop();
+  results.forEach(remember);
   for (const r of results) printResult(r);
-  record(userInput, results);
 }
 
 async function askJudge(userInput: string, author: Backend) {
   const judgeBackend: Backend = author === "claude" ? "codex" : "claude";
   const stop = spinner(`${author} drafting → ${judgeBackend} reviewing…`);
+  // Draft resumes the author's session; the review runs standalone so the
+  // reviewer's own thread isn't polluted with meta-analysis.
   const { draft, review } = await judge(
     userInput,
     author,
     judgeBackend,
     optsFor(author),
-    optsFor(judgeBackend),
-    buildPrompt(author, userInput),
+    { model: state.models[judgeBackend], cwd: process.cwd() },
   );
   stop();
   console.log(`\n${C.dim}── draft by${C.reset} ${badge(author)} ${C.dim}──${C.reset}`);
   printResult(draft);
   console.log(`\n${C.dim}── review by${C.reset} ${badge(judgeBackend)} ${C.dim}──${C.reset}`);
   printResult(review);
-  // Record the reviewed final answer as the author's turn so the thread continues.
-  record(userInput, [{ ...review, backend: author }]);
+  remember(draft); // keep the author's thread advancing
 }
 
 // --- interactive REPL ------------------------------------------------------
@@ -154,13 +160,14 @@ ${C.bold}MultiAI — commands${C.reset}
   ${C.cyan}/judge <text>${C.reset}           one model drafts, the other reviews & improves
   ${C.cyan}/model <name>${C.reset}           set model for the active backend (e.g. haiku, gpt-5)
   ${C.cyan}/model clear${C.reset}            reset the active backend's model to default
-  ${C.cyan}/memory on|off${C.reset}          toggle whether prior turns are sent as context
-  ${C.cyan}/reset${C.reset}                  clear the conversation history
-  ${C.cyan}/history${C.reset}                show how many turns are remembered
-  ${C.cyan}/status${C.reset}                 show current target, models & memory
+  ${C.cyan}/memory on|off${C.reset}          toggle continuing the session vs. one-off turns
+  ${C.cyan}/reset${C.reset}                  start a fresh session (forget the conversation)
+  ${C.cyan}/history${C.reset}                show each backend's session status
+  ${C.cyan}/status${C.reset}                 show target, models, memory & sessions
   ${C.cyan}/help${C.reset}                   show this help
   ${C.cyan}/exit${C.reset} (or Ctrl-D)       quit
-${C.dim}Memory is on by default: each backend sees its own prior replies as context.${C.reset}
+${C.dim}Memory is on by default via native sessions (claude --resume / codex resume).
+Claude streams token-by-token; Codex returns its answer whole.${C.reset}
 `;
 
 function promptStr(): string {
@@ -182,14 +189,17 @@ async function handleLine(line: string, rl: readline.Interface): Promise<boolean
       case "help":
         console.log(HELP);
         return true;
-      case "status":
+      case "status": {
+        const sess = (b: Backend) => (state.sessions[b] ? "active" : "none");
         console.log(
           `active=${targetLabel(state.active)}  ` +
             `claude model=${state.models.claude ?? "default"}  ` +
             `codex model=${state.models.codex ?? "default"}  ` +
-            `memory=${state.memory ? "on" : "off"} (${state.history.length} turns)`,
+            `memory=${state.memory ? "on" : "off"}  ` +
+            `sessions(claude=${sess("claude")}, codex=${sess("codex")})`,
         );
         return true;
+      }
       case "memory":
         if (rest[0] === "on" || rest[0] === "off") {
           state.memory = rest[0] === "on";
@@ -197,11 +207,14 @@ async function handleLine(line: string, rl: readline.Interface): Promise<boolean
         } else console.log(`${C.yellow}usage: /memory on|off${C.reset}`);
         return true;
       case "reset":
-        state.history = [];
-        console.log(`${C.green}✓${C.reset} conversation history cleared`);
+        state.sessions = {};
+        console.log(`${C.green}✓${C.reset} conversation reset — next turn starts a fresh session`);
         return true;
       case "history":
-        console.log(`${C.dim}${state.history.length} turn(s) remembered; memory ${state.memory ? "on" : "off"}${C.reset}`);
+        console.log(
+          `${C.dim}sessions: claude=${state.sessions.claude ? "active" : "none"}, ` +
+            `codex=${state.sessions.codex ? "active" : "none"}; memory ${state.memory ? "on" : "off"}${C.reset}`,
+        );
         return true;
       case "use":
         if (rest[0] === "claude" || rest[0] === "codex" || rest[0] === "both") {
