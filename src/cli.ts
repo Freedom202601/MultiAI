@@ -25,9 +25,11 @@ const badge = (b: Backend) =>
 function spinner(label: string): () => void {
   if (!process.stderr.isTTY) return () => {};
   const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  const start = Date.now();
   let i = 0;
   const t = setInterval(() => {
-    process.stderr.write(`\r${C.dim}${frames[i++ % frames.length]} ${label}${C.reset}\x1b[K`);
+    const secs = Math.floor((Date.now() - start) / 1000);
+    process.stderr.write(`\r${C.dim}${frames[i++ % frames.length]} ${label} ${secs}s${C.reset}\x1b[K`);
   }, 80);
   return () => {
     clearInterval(t);
@@ -94,10 +96,11 @@ async function dispatch(target: Target, prompt: string) {
   else await askOne(target, prompt);
 }
 
-async function askOne(b: Backend, userInput: string) {
+// Run one backend and print it live: Claude streams token-by-token; Codex has
+// no token deltas, so it shows a spinner then prints its answer whole.
+async function askBackend(b: Backend, userInput: string, opts: RunOptions): Promise<RunResult> {
   const stop = spinner(`${b} thinking…`);
   let streamed = false;
-  // Claude streams token-by-token; Codex returns whole (its --json has no deltas).
   const onToken =
     b === "claude"
       ? (t: string) => {
@@ -109,7 +112,7 @@ async function askOne(b: Backend, userInput: string) {
           process.stdout.write(t);
         }
       : undefined;
-  const r = await run(b, userInput, { ...optsFor(b), onToken });
+  const r = await run(b, userInput, { ...opts, onToken });
   if (!streamed) {
     stop();
     printResult(r);
@@ -117,18 +120,24 @@ async function askOne(b: Backend, userInput: string) {
     process.stdout.write("\n");
     printMeta(r);
   }
-  remember(r);
+  return r;
+}
+
+async function askOne(b: Backend, userInput: string) {
+  remember(await askBackend(b, userInput, optsFor(b)));
 }
 
 async function askBoth(userInput: string) {
-  const stop = spinner("claude + codex thinking…");
-  const results = await Promise.all([
-    run("claude", userInput, optsFor("claude")),
-    run("codex", userInput, optsFor("codex")),
-  ]);
+  // Codex returns its answer whole, so start it in the background and let it run
+  // while Claude streams live; then surface Codex. Wall time ≈ the slower one.
+  const codexPromise = run("codex", userInput, optsFor("codex"));
+  remember(await askBackend("claude", userInput, optsFor("claude")));
+
+  const stop = spinner("codex thinking…");
+  const codexRes = await codexPromise;
   stop();
-  results.forEach(remember);
-  for (const r of results) printResult(r);
+  printResult(codexRes);
+  remember(codexRes);
 }
 
 async function askJudge(userInput: string, author: Backend) {
