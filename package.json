@@ -1,0 +1,17 @@
+{
+  "name": "multiai",
+  "version": "0.1.0",
+  "description": "A unified CLI shell that drives Claude Code and Codex side by side, reusing their own auth.",
+  "type": "module",
+  "bin": {
+    "multiai": "src/cli.ts"
+  },
+  "scripts": {
+    "start": "node src/cli.ts",
+    "link": "npm link"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "license": "MIT"
+}
