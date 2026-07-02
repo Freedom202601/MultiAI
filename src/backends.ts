@@ -52,6 +52,7 @@ export interface RunResult {
   ms: number;
   costUsd?: number;
   sessionId?: string; // pass back as opts.resume next turn to keep context
+  activities?: string[]; // tools/commands the backend ran (for buffered display)
 }
 
 // Spawn a process, delivering each complete stdout line to `onLine` as it
@@ -161,6 +162,7 @@ export async function runCodex(prompt: string, opts: RunOptions = {}): Promise<R
 
   let text = "";
   let threadId: string | undefined;
+  const activities: string[] = [];
 
   const { code, stderr } = await execLines("codex", args, { cwd: opts.cwd }, (line) => {
     let j: any;
@@ -169,16 +171,30 @@ export async function runCodex(prompt: string, opts: RunOptions = {}): Promise<R
     } catch {
       return;
     }
-    if (j.type === "thread.started" && j.thread_id) threadId = j.thread_id;
-    else if (j.type === "item.completed" && j.item?.type === "agent_message")
-      text = j.item.text ?? text;
+    if (j.type === "thread.started" && j.thread_id) {
+      threadId = j.thread_id;
+    } else if (j.type === "item.started" && j.item?.type === "command_execution") {
+      // Codex ran a shell command — strip the `/bin/<sh> -lc` wrapper for display.
+      let cmd = String(j.item.command ?? "").replace(/^\/bin\/\w+\s+-lc\s+/, "");
+      cmd = cmd.replace(/\s+/g, " ").trim();
+      if (cmd.length > 60) cmd = `${cmd.slice(0, 57)}…`;
+      const label = `$ ${cmd}`;
+      activities.push(label);
+      opts.onActivity?.(label);
+    } else if (j.type === "item.completed" && j.item?.type === "agent_message") {
+      // Intermediate narration and the final answer both arrive here; the last
+      // one is the answer. Stream each live when a consumer is listening.
+      const t: string = j.item.text ?? "";
+      text = t;
+      opts.onToken?.(`${t}\n`);
+    }
   });
   const ms = Date.now() - start;
 
   text = text.trim();
-  if (!text) return { backend: "codex", text: "", ok: false, error: stderr.trim() || `exit ${code}`, ms };
+  if (!text) return { backend: "codex", text: "", ok: false, error: stderr.trim() || `exit ${code}`, ms, activities };
   // On resume the thread id keeps its original value; caller retains it if undefined.
-  return { backend: "codex", text, ok: true, ms, sessionId: threadId ?? opts.resume };
+  return { backend: "codex", text, ok: true, ms, sessionId: threadId ?? opts.resume, activities };
 }
 
 export function run(backend: Backend, prompt: string, opts: RunOptions = {}): Promise<RunResult> {

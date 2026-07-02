@@ -54,7 +54,9 @@ function printResult(r: RunResult) {
     console.log(`\n${badge(r.backend)} ${C.red}✗ error${C.reset} ${metaStr(r)}\n${C.red}${r.error}${C.reset}`);
     return;
   }
-  console.log(`\n${badge(r.backend)} ${metaStr(r)}\n${r.text}`);
+  console.log(`\n${badge(r.backend)} ${metaStr(r)}`);
+  for (const a of r.activities ?? []) console.log(`${C.dim}⚙ ${a}${C.reset}`);
+  console.log(r.text);
 }
 
 // --- session state ---------------------------------------------------------
@@ -109,24 +111,19 @@ async function askBackend(b: Backend, userInput: string, opts: RunOptions): Prom
       streamed = true;
     }
   };
-  // Claude streams text + tool activity live; Codex has no deltas (stays undefined).
-  const onToken =
-    b === "claude"
-      ? (t: string) => {
-          begin();
-          process.stdout.write(t);
-          midLine = !t.endsWith("\n");
-        }
-      : undefined;
-  const onActivity =
-    b === "claude"
-      ? (label: string) => {
-          begin();
-          if (midLine) process.stdout.write("\n");
-          process.stdout.write(`${C.dim}⚙ ${label}${C.reset}\n`);
-          midLine = false;
-        }
-      : undefined;
+  // Both backends stream live here: Claude emits token deltas + tool calls;
+  // Codex emits whole narration messages + the shell commands it runs.
+  const onToken = (t: string) => {
+    begin();
+    process.stdout.write(t);
+    midLine = !t.endsWith("\n");
+  };
+  const onActivity = (label: string) => {
+    begin();
+    if (midLine) process.stdout.write("\n");
+    process.stdout.write(`${C.dim}⚙ ${label}${C.reset}\n`);
+    midLine = false;
+  };
   const r = await run(b, userInput, { ...opts, onToken, onActivity });
   if (!streamed) {
     stop();

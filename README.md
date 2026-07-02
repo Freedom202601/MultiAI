@@ -73,13 +73,13 @@ at once. Override the startup default with `MULTIAI_DEFAULT=claude|codex|both`.
 
 ## Streaming & memory
 
-- **Streaming:** Claude streams its answer token-by-token, and its tool calls
-  show up live as dim `⚙ Read(file)` / `⚙ WebSearch(query)` / `⚙ Task(…)` lines
-  so you can see it working during a long agentic run — not just a spinner. In
-  `both` mode Codex runs in the background while Claude streams, then its answer
-  is shown when ready (Codex returns whole — its `--json` mode emits no token
-  deltas in the current version). Spinners show elapsed seconds. `/judge` runs to
-  completion before printing.
+- **Streaming & activity:** you can see both agents work, not just a spinner.
+  Claude streams its answer token-by-token with its tool calls shown as dim
+  `⚙ Read(file)` / `⚙ WebSearch(query)` / `⚙ Task(…)` lines. Codex shows the
+  shell commands it runs as `⚙ $ …` lines — live when it's the single active
+  backend, or listed with its answer in `both` mode (where Codex runs buffered
+  in the background so it doesn't garble Claude's live stream). Spinners show
+  elapsed seconds. `/judge` runs to completion before printing.
 - **Memory (on by default):** MultiAI uses each tool's *native* session — it
   stores the `session_id` / `thread_id` returned by a call and passes it back
   via `claude --resume` / `codex exec resume` on the next turn. Each backend
